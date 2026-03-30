@@ -5,7 +5,7 @@ __pycache__/
 *.pyc
 .DS_Store
 tmp/
-data/
+/data/
 checkpoints/
 notebooks/.ipynb_checkpoints/
 src/*.egg-info/
