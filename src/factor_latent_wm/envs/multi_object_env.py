@@ -110,7 +110,10 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
             self.np_random = np.random.default_rng(seed)
         options = options or {}
         self.step_count = 0
-        self.current_task = options.get("task", self.np_random.choice(self.config.task_types).item())
+        sampled_task = options.get("task")
+        if sampled_task is None:
+            sampled_task = str(self.np_random.choice(self.config.task_types))
+        self.current_task = str(sampled_task)
         occupied: set[tuple[int, int]] = set()
         self.has_key = False
         self.door_open = False
