@@ -44,6 +44,22 @@ ACTION_DELTAS = {
 
 MAX_ENTITIES = 8
 ENTITY_FEATURE_DIM = 14
+TASK_FAMILIES = {
+    "reach": "navigation",
+    "key_door": "navigation_interaction",
+    "push": "push_interaction",
+}
+TASK_FAMILY_IDS = {
+    "navigation": 0,
+    "navigation_interaction": 1,
+    "push_interaction": 2,
+}
+SPLIT_IDS = {
+    "train": 0,
+    "val": 1,
+    "test": 2,
+    "unspecified": 3,
+}
 
 
 @dataclass
@@ -86,6 +102,7 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
         self.np_random = np.random.default_rng(seed)
         self.step_count = 0
         self.current_task = "reach"
+        self.current_split = "unspecified"
         self.agent = Entity(EntityType.AGENT, np.zeros(2, dtype=np.int64), np.zeros(2, dtype=np.int64))
         self.key = Entity(EntityType.KEY, np.zeros(2, dtype=np.int64), np.zeros(2, dtype=np.int64), active=False)
         self.door = Entity(EntityType.DOOR, np.zeros(2, dtype=np.int64), np.zeros(2, dtype=np.int64), active=False)
@@ -110,9 +127,17 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
             self.np_random = np.random.default_rng(seed)
         options = options or {}
         self.step_count = 0
+        self.current_split = str(options.get("split", "unspecified"))
         sampled_task = options.get("task")
+        sampled_family = options.get("task_family")
         if sampled_task is None:
-            sampled_task = str(self.np_random.choice(self.config.task_types))
+            if sampled_family is not None:
+                family_tasks = [task for task in self.config.task_types if TASK_FAMILIES.get(task) == sampled_family]
+                if not family_tasks:
+                    raise ValueError(f"Unknown or empty task family: {sampled_family}")
+                sampled_task = str(self.np_random.choice(family_tasks))
+            else:
+                sampled_task = str(self.np_random.choice(self.config.task_types))
         self.current_task = str(sampled_task)
         occupied: set[tuple[int, int]] = set()
         self.has_key = False
@@ -210,13 +235,56 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
         raise ValueError(f"Unknown task {self.current_task}")
 
     def _reward(self) -> float:
-        if self._is_success():
-            return 1.0
-        agent_dist = np.linalg.norm(self.agent.position - self.target.position, ord=1)
-        return -0.01 * float(agent_dist)
+        if self.current_task == "reach":
+            dist = np.linalg.norm(self.agent.position - self.target.position, ord=1)
+            return 1.0 if self._is_success() else -0.05 * float(dist)
+        if self.current_task == "key_door":
+            key_dist = np.linalg.norm(self.agent.position - self.key.position, ord=1)
+            door_dist = np.linalg.norm(self.agent.position - self.door.position, ord=1)
+            target_dist = np.linalg.norm(self.agent.position - self.target.position, ord=1)
+            reward = -0.02 * float(key_dist if not self.has_key else (door_dist if not self.door_open else target_dist))
+            if self.has_key:
+                reward += 0.2
+            if self.door_open:
+                reward += 0.4
+            if self._is_success():
+                reward += 1.0
+            return reward
+        if self.current_task == "push":
+            block_dist = np.linalg.norm(self.block.position - self.target.position, ord=1)
+            push_contact = np.linalg.norm(self.agent.position - self.block.position, ord=1)
+            reward = -0.03 * float(block_dist) - 0.01 * float(push_contact)
+            if self._is_success():
+                reward += 1.0
+            return reward
+        raise ValueError(f"Unknown task {self.current_task}")
 
     def _task_id(self) -> int:
         return {"reach": 0, "key_door": 1, "push": 2}[self.current_task]
+
+    def _task_family(self) -> str:
+        return TASK_FAMILIES[self.current_task]
+
+    def _task_family_id(self) -> int:
+        return TASK_FAMILY_IDS[self._task_family()]
+
+    def _split_id(self) -> int:
+        return SPLIT_IDS.get(self.current_split, SPLIT_IDS["unspecified"])
+
+    def _task_progress(self) -> float:
+        if self.current_task == "reach":
+            dist = np.linalg.norm(self.agent.position - self.target.position, ord=1)
+            return float(-dist)
+        if self.current_task == "key_door":
+            if not self.has_key:
+                return float(-np.linalg.norm(self.agent.position - self.key.position, ord=1))
+            if not self.door_open:
+                return float(-np.linalg.norm(self.agent.position - self.door.position, ord=1))
+            return float(-np.linalg.norm(self.agent.position - self.target.position, ord=1))
+        if self.current_task == "push":
+            block_dist = np.linalg.norm(self.block.position - self.target.position, ord=1)
+            return float(-block_dist)
+        raise ValueError(f"Unknown task {self.current_task}")
 
     def _goal_vector(self) -> np.ndarray:
         goal = np.zeros(8, dtype=np.float32)
@@ -247,6 +315,9 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
         feat[13] = 1.0 if (entity.kind == EntityType.AGENT and self.has_key) else float(self.door_open)
         return feat
 
+    def get_state_tokens(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.get_entity_tensor()
+
     def get_entity_tensor(self) -> tuple[np.ndarray, np.ndarray]:
         entities = [
             self.agent.copy(),
@@ -268,10 +339,17 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
         return {
             "task": self.current_task,
             "task_id": self._task_id(),
+            "task_family": self._task_family(),
+            "task_family_id": self._task_family_id(),
+            "split_name": self.current_split,
+            "split_id": self._split_id(),
             "goal_vector": self._goal_vector(),
             "entity_features": feats,
             "entity_mask": mask,
+            "state_tokens": feats,
+            "state_mask": mask,
             "success": self._is_success(),
+            "task_progress": self._task_progress(),
         }
 
     def step(self, action: int):
@@ -316,3 +394,21 @@ class MultiObjectEnv(gym.Env[np.ndarray, int]):
             draw(distractor, COLORS["distractor"])
         draw(self.agent, COLORS["agent"])
         return canvas.astype(np.uint8)
+
+    def snapshot(self) -> dict[str, Any]:
+        frame = self.render()
+        state_tokens, state_mask = self.get_state_tokens()
+        info = self._build_info()
+        return {
+            "frame": frame,
+            "state_tokens": state_tokens,
+            "state_mask": state_mask,
+            "task": self.current_task,
+            "task_id": info["task_id"],
+            "task_family": info["task_family"],
+            "task_family_id": info["task_family_id"],
+            "split_name": info["split_name"],
+            "split_id": info["split_id"],
+            "goal_vector": info["goal_vector"],
+            "task_progress": info["task_progress"],
+        }

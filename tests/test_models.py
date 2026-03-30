@@ -27,10 +27,12 @@ def test_factor_model_shapes():
     assert outputs["current_reconstruction"].shape == (2, 3, 84, 84)
     assert outputs["predicted_next_entities"].shape == (2, 8, 14)
     assert outputs["agent_action_logits"].shape == (2, 5)
+    assert outputs["ctrl_posterior"].shape == (2, 16)
+    assert outputs["exo_posterior"].shape == (2, 8, 16)
 
 
 def test_slot_factor_model_shapes():
-    model = FactorisedLatentActionModel(ModelConfig(encoder_type="slot"))
+    model = FactorisedLatentActionModel(ModelConfig(encoder_type="pixel_slot"))
     outputs = model(_make_batch())
     assert outputs["current_reconstruction"].shape == (2, 3, 84, 84)
     assert outputs["predicted_next_entities"].shape == (2, 8, 14)

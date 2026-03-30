@@ -10,8 +10,8 @@ class EnvConfig:
     grid_size: int = 10
     render_size: int = 84
     max_steps: int = 40
-    max_hazards: int = 2
-    max_distractors: int = 2
+    max_hazards: int = 1
+    max_distractors: int = 1
     task_types: tuple[str, ...] = ("reach", "key_door", "push")
 
 
@@ -27,7 +27,7 @@ class DatasetConfig:
 
 @dataclass
 class ModelConfig:
-    encoder_type: str = "entity"
+    encoder_type: str = "state_factor"
     image_channels: int = 3
     factor_dim: int = 128
     latent_action_dim: int = 16
@@ -49,6 +49,7 @@ class TrainConfig:
     batch_size: int = 64
     stage1_epochs: int = 15
     stage2_epochs: int = 8
+    rollout_horizon: int = 5
     learning_rate: float = 3e-4
     weight_decay: float = 1e-5
     device: str = "cpu"
@@ -58,11 +59,11 @@ class TrainConfig:
 
 @dataclass
 class EvalConfig:
-    episodes: int = 100
-    planner_horizon: int = 12
-    planner_iterations: int = 4
-    planner_population: int = 64
-    planner_elite_count: int = 8
+    episodes: int = 30
+    planner_horizon: int = 5
+    planner_iterations: int = 3
+    planner_population: int = 32
+    planner_elite_count: int = 6
 
 
 @dataclass

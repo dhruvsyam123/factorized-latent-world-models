@@ -8,27 +8,42 @@ from torch import nn
 
 from factor_latent_wm.config.core import ModelConfig
 from factor_latent_wm.models.components import (
+    ControlBridge,
     EntityDecoder,
     EntityFactorEncoder,
-    FactorDynamics,
     ImageDecoder,
     ImageEncoder,
-    SlotAttentionEncoder,
     SpatialImageEncoder,
+    SlotAttentionEncoder,
+    StateDecoder,
+    StateTokenEncoder,
+    TokenDynamics,
+    masked_mean,
 )
 
 
 class FactorisedLatentActionModel(nn.Module):
+    """State-first object-factor world model with an optional slot-based pixel encoder."""
+
     def __init__(self, config: ModelConfig, image_size: int = 84):
         super().__init__()
         self.config = config
+        if self.config.encoder_type == "entity":
+            self.config.encoder_type = "state_factor"
+        if self.config.encoder_type == "slot":
+            self.config.encoder_type = "pixel_slot"
         self.image_encoder = ImageEncoder(config.image_channels, config.hidden_dim, config.factor_dim)
-        self.entity_encoder = None
+        self.image_decoder = ImageDecoder(config.factor_dim, config.image_channels, image_size, config.decoder_channels)
+        self.state_decoder = StateDecoder(config.factor_dim, config.entity_feature_dim)
+
+        self.state_encoder = None
         self.slot_feature_encoder = None
         self.slot_encoder = None
-        if config.encoder_type == "entity":
-            self.entity_encoder = EntityFactorEncoder(config.entity_feature_dim, config.factor_dim)
-        elif config.encoder_type == "slot":
+        self.token_count = config.max_entities
+        self.anchor_mode = "agent"
+        if config.encoder_type == "state_factor":
+            self.state_encoder = StateTokenEncoder(config.entity_feature_dim, config.factor_dim)
+        elif config.encoder_type == "pixel_slot":
             self.slot_feature_encoder = SpatialImageEncoder(config.image_channels, config.hidden_dim, config.factor_dim)
             self.slot_encoder = SlotAttentionEncoder(
                 num_slots=config.max_entities,
@@ -37,24 +52,20 @@ class FactorisedLatentActionModel(nn.Module):
                 iterations=config.slot_iterations,
                 mlp_dim=config.slot_mlp_dim,
             )
+            self.anchor_mode = "pooled"
         else:
             raise ValueError(f"Unknown encoder_type {config.encoder_type}")
-        self.latent_inference = nn.Sequential(
-            nn.Linear(config.factor_dim * 2, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, config.latent_action_dim),
+
+        self.control_bridge = ControlBridge(
+            factor_dim=config.factor_dim,
+            latent_dim=config.latent_action_dim,
+            num_actions=config.num_actions,
+            hidden_dim=config.hidden_dim,
         )
-        self.dynamics = FactorDynamics(config.factor_dim, config.latent_action_dim, config.num_attention_heads)
-        self.decoder = ImageDecoder(config.factor_dim, config.image_channels, image_size, config.decoder_channels)
-        self.entity_decoder = EntityDecoder(config.factor_dim, config.entity_feature_dim)
-        self.action_head = nn.Sequential(
-            nn.Linear(config.latent_action_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, config.num_actions),
-        )
+        self.dynamics = TokenDynamics(config.factor_dim, config.latent_action_dim, config.num_attention_heads)
 
     def factor_mask(self, entity_mask: torch.Tensor) -> torch.Tensor:
-        if self.config.encoder_type == "slot":
+        if self.config.encoder_type == "pixel_slot":
             return torch.ones(
                 entity_mask.shape[0],
                 self.config.max_entities,
@@ -64,72 +75,135 @@ class FactorisedLatentActionModel(nn.Module):
         return entity_mask
 
     def encode(self, image: torch.Tensor, entity_features: torch.Tensor, entity_mask: torch.Tensor) -> torch.Tensor:
-        factor_mask = self.factor_mask(entity_mask)
-        if self.config.encoder_type == "entity":
-            global_context = self.image_encoder(image)
-            assert self.entity_encoder is not None
-            factors = self.entity_encoder(entity_features, global_context)
-            return factors * factor_mask.unsqueeze(-1)
+        if self.config.encoder_type == "state_factor":
+            assert self.state_encoder is not None
+            tokens = self.state_encoder(entity_features)
+            return tokens * entity_mask.unsqueeze(-1)
 
         assert self.slot_feature_encoder is not None
         assert self.slot_encoder is not None
-        slots = self.slot_encoder(self.slot_feature_encoder(image))
-        return slots * factor_mask.unsqueeze(-1)
+        tokens = self.slot_encoder(self.slot_feature_encoder(image))
+        return tokens * self.factor_mask(entity_mask).unsqueeze(-1)
 
-    def infer_latent_actions(self, factors: torch.Tensor, next_factors: torch.Tensor) -> torch.Tensor:
-        return self.latent_inference(torch.cat([factors, next_factors], dim=-1))
+    def control_anchor(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if self.anchor_mode == "agent":
+            return tokens[:, 0]
+        return masked_mean(tokens, mask)
 
     def infer_control_latent(self, factors: torch.Tensor, next_factors: torch.Tensor) -> torch.Tensor:
-        return self.infer_latent_actions(factors, next_factors)[:, 0]
+        mask = torch.ones(factors.shape[:2], device=factors.device, dtype=factors.dtype)
+        ctrl, _ = self.control_bridge.posterior(
+            self.control_anchor(factors, mask),
+            self.control_anchor(next_factors, mask),
+            factors,
+            next_factors,
+        )
+        return ctrl
+
+    def infer_latent_actions(self, factors: torch.Tensor, next_factors: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones(factors.shape[:2], device=factors.device, dtype=factors.dtype)
+        ctrl, exo = self.control_bridge.posterior(
+            self.control_anchor(factors, mask),
+            self.control_anchor(next_factors, mask),
+            factors,
+            next_factors,
+        )
+        return torch.cat([ctrl, exo.flatten(1)], dim=-1)
+
+    def prior_latents(self, factors: torch.Tensor, entity_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        factor_mask = self.factor_mask(entity_mask)
+        return self.control_bridge.prior(self.control_anchor(factors, factor_mask), factors)
+
+    def action_logits(self, control_latent: torch.Tensor) -> torch.Tensor:
+        return self.control_bridge.action_logits(control_latent)
+
+    def action_to_control(self, actions: torch.Tensor) -> torch.Tensor:
+        return self.control_bridge.action_to_control(actions)
 
     def predict_next_factors(
-        self, factors: torch.Tensor, latent_actions: torch.Tensor, entity_mask: torch.Tensor
+        self,
+        factors: torch.Tensor,
+        control_latent: torch.Tensor,
+        exo_latent: torch.Tensor,
+        entity_mask: torch.Tensor,
     ) -> torch.Tensor:
-        return self.dynamics(factors, latent_actions, entity_mask)
+        factor_mask = self.factor_mask(entity_mask)
+        return self.dynamics(factors, control_latent, exo_latent, factor_mask)
 
     def decode_image(self, factors: torch.Tensor, entity_mask: torch.Tensor) -> torch.Tensor:
-        return self.decoder(factors, entity_mask)
+        factor_mask = self.factor_mask(entity_mask)
+        return self.image_decoder(factors, factor_mask)
 
-    def predict_entities(self, factors: torch.Tensor) -> torch.Tensor:
-        return self.entity_decoder(factors)
-
-    def action_logits(self, agent_latent: torch.Tensor) -> torch.Tensor:
-        return self.action_head(agent_latent)
+    def decode_state(self, factors: torch.Tensor) -> torch.Tensor:
+        return self.state_decoder(factors)
 
     def rollout_step(
         self,
         factors: torch.Tensor,
         entity_mask: torch.Tensor,
-        agent_latent_action: torch.Tensor,
+        control_latent: torch.Tensor,
+        exo_latent: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         factor_mask = self.factor_mask(entity_mask)
-        latents = torch.zeros(
-            factors.shape[0],
-            factors.shape[1],
-            self.config.latent_action_dim,
-            device=factors.device,
-            dtype=factors.dtype,
-        )
-        latents[:, 0] = agent_latent_action
-        next_factors = self.predict_next_factors(factors, latents, factor_mask)
-        predicted_entities = self.predict_entities(next_factors)
+        if exo_latent is None:
+            _, exo_latent = self.prior_latents(factors, entity_mask)
+        next_factors = self.dynamics(factors, control_latent, exo_latent, factor_mask)
+        predicted_entities = self.decode_state(next_factors)
         return next_factors, predicted_entities
 
+    def rollout_sequence(
+        self,
+        factors: torch.Tensor,
+        entity_mask: torch.Tensor,
+        control_sequence: torch.Tensor,
+        exo_sequence: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rollout_factors = factors
+        predicted_entities = self.decode_state(factors)
+        for step in range(control_sequence.shape[1]):
+            exo_step = None if exo_sequence is None else exo_sequence[:, step]
+            rollout_factors, predicted_entities = self.rollout_step(
+                rollout_factors,
+                entity_mask,
+                control_sequence[:, step],
+                exo_step,
+            )
+        return rollout_factors, predicted_entities
+
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        factor_mask = self.factor_mask(batch["entity_mask"])
-        factors = self.encode(batch["image"], batch["entity_features"], batch["entity_mask"])
-        next_factors_true = self.encode(batch["next_image"], batch["next_entity_features"], batch["entity_mask"])
-        latent_actions = self.infer_latent_actions(factors, next_factors_true)
-        predicted_next_factors = self.predict_next_factors(factors, latent_actions, factor_mask)
+        entity_mask = batch["entity_mask"]
+        factor_mask = self.factor_mask(entity_mask)
+        factors = self.encode(batch["image"], batch["entity_features"], entity_mask)
+        next_factors_true = self.encode(batch["next_image"], batch["next_entity_features"], entity_mask)
+
+        ctrl_post, exo_post = self.control_bridge.posterior(
+            self.control_anchor(factors, factor_mask),
+            self.control_anchor(next_factors_true, factor_mask),
+            factors,
+            next_factors_true,
+        )
+        ctrl_prior, exo_prior = self.prior_latents(factors, entity_mask)
+
+        posterior_next_factors = self.predict_next_factors(factors, ctrl_post, exo_post, entity_mask)
+        prior_next_factors = self.predict_next_factors(factors, ctrl_prior, exo_prior, entity_mask)
 
         return {
-            "current_reconstruction": self.decode_image(factors, factor_mask),
-            "next_reconstruction": self.decode_image(predicted_next_factors, factor_mask),
-            "predicted_next_entities": self.predict_entities(predicted_next_factors),
-            "true_latent_actions": latent_actions,
-            "agent_action_logits": self.action_logits(latent_actions[:, 0]),
+            "current_state_pred": self.decode_state(factors),
+            "prior_current_state_pred": self.decode_state(factors),
+            "current_reconstruction": self.decode_image(factors, entity_mask),
+            "next_reconstruction": self.decode_image(posterior_next_factors, entity_mask),
+            "prior_next_reconstruction": self.decode_image(prior_next_factors, entity_mask),
+            "predicted_next_entities": self.decode_state(posterior_next_factors),
+            "prior_predicted_next_entities": self.decode_state(prior_next_factors),
             "factors": factors,
-            "predicted_next_factors": predicted_next_factors,
+            "predicted_next_factors": posterior_next_factors,
+            "prior_predicted_next_factors": prior_next_factors,
+            "ctrl_posterior": ctrl_post,
+            "exo_posterior": exo_post,
+            "ctrl_prior": ctrl_prior,
+            "exo_prior": exo_prior,
+            "agent_action_logits": self.action_logits(ctrl_post),
+            "action_control_latent": self.action_to_control(batch["action"].clamp_min(0)),
             "factor_mask": factor_mask,
         }
 

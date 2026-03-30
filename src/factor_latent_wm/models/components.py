@@ -4,6 +4,11 @@ import torch
 from torch import nn
 
 
+def masked_mean(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weights = mask.unsqueeze(-1)
+    return (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+
 class ImageEncoder(nn.Module):
     def __init__(self, in_channels: int, hidden_dim: int, out_dim: int):
         super().__init__()
@@ -55,6 +60,19 @@ class EntityFactorEncoder(nn.Module):
         return local + global_context.unsqueeze(1)
 
 
+class StateTokenEncoder(nn.Module):
+    def __init__(self, entity_feature_dim: int, token_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(entity_feature_dim, token_dim),
+            nn.ReLU(),
+            nn.Linear(token_dim, token_dim),
+        )
+
+    def forward(self, entity_features: torch.Tensor) -> torch.Tensor:
+        return self.mlp(entity_features)
+
+
 class SlotAttentionEncoder(nn.Module):
     def __init__(self, num_slots: int, input_dim: int, slot_dim: int, iterations: int, mlp_dim: int):
         super().__init__()
@@ -103,23 +121,112 @@ class SlotAttentionEncoder(nn.Module):
         return slots
 
 
-class FactorDynamics(nn.Module):
-    def __init__(self, factor_dim: int, latent_dim: int, num_heads: int):
+class ControlBridge(nn.Module):
+    def __init__(self, factor_dim: int, latent_dim: int, num_actions: int, hidden_dim: int):
         super().__init__()
-        self.action_proj = nn.Linear(latent_dim, factor_dim)
-        self.attn = nn.MultiheadAttention(factor_dim, num_heads=num_heads, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(factor_dim * 2, factor_dim),
+        self.factor_dim = factor_dim
+        self.latent_dim = latent_dim
+        self.num_actions = num_actions
+        self.ctrl_posterior = nn.Sequential(
+            nn.Linear(factor_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(factor_dim, factor_dim),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.ctrl_prior = nn.Sequential(
+            nn.Linear(factor_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.exo_posterior = nn.Sequential(
+            nn.Linear(factor_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.exo_prior = nn.Sequential(
+            nn.Linear(factor_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.action_to_ctrl = nn.Embedding(num_actions, latent_dim)
+        self.ctrl_to_action = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_actions),
         )
 
-    def forward(self, factors: torch.Tensor, latent_actions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        action_emb = self.action_proj(latent_actions)
-        fused = factors + action_emb
+    def posterior(
+        self,
+        control_current: torch.Tensor,
+        control_next: torch.Tensor,
+        current_tokens: torch.Tensor,
+        next_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctrl = self.ctrl_posterior(torch.cat([control_current, control_next], dim=-1))
+        token_pair = torch.cat([current_tokens, next_tokens], dim=-1)
+        exo = self.exo_posterior(token_pair)
+        return ctrl, exo
+
+    def prior(self, control_anchor: torch.Tensor, current_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        ctrl = self.ctrl_prior(control_anchor)
+        exo = self.exo_prior(current_tokens)
+        return ctrl, exo
+
+    def action_logits(self, control_latent: torch.Tensor) -> torch.Tensor:
+        return self.ctrl_to_action(control_latent)
+
+    def action_to_control(self, actions: torch.Tensor) -> torch.Tensor:
+        return self.action_to_ctrl(actions.clamp_min(0))
+
+
+class TokenDynamics(nn.Module):
+    def __init__(self, token_dim: int, latent_dim: int, num_heads: int):
+        super().__init__()
+        self.ctrl_proj = nn.Linear(latent_dim, token_dim)
+        self.exo_proj = nn.Linear(latent_dim, token_dim)
+        self.attn = nn.MultiheadAttention(token_dim, num_heads=num_heads, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim * 2, token_dim),
+            nn.ReLU(),
+            nn.Linear(token_dim, token_dim),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        control_latent: torch.Tensor,
+        exo_latent: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        ctrl_emb = self.ctrl_proj(control_latent).unsqueeze(1)
+        if exo_latent.dim() == 2:
+            exo_emb = self.exo_proj(exo_latent).unsqueeze(1).expand(-1, tokens.shape[1], -1)
+        else:
+            exo_emb = self.exo_proj(exo_latent)
+        fused = tokens + ctrl_emb + exo_emb
         key_padding_mask = mask < 0.5
         attended, _ = self.attn(fused, fused, fused, key_padding_mask=key_padding_mask)
-        output = self.mlp(torch.cat([factors, attended], dim=-1))
+        output = self.mlp(torch.cat([tokens, attended], dim=-1))
+        return output * mask.unsqueeze(-1)
+
+
+class SceneDynamics(nn.Module):
+    def __init__(self, token_dim: int, latent_dim: int, num_heads: int):
+        super().__init__()
+        self.ctrl_proj = nn.Linear(latent_dim, token_dim)
+        self.exo_proj = nn.Linear(latent_dim, token_dim)
+        self.attn = nn.MultiheadAttention(token_dim, num_heads=num_heads, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim * 2, token_dim),
+            nn.ReLU(),
+            nn.Linear(token_dim, token_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor, control_latent: torch.Tensor, exo_latent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        ctrl_emb = self.ctrl_proj(control_latent).unsqueeze(1)
+        exo_emb = self.exo_proj(exo_latent).unsqueeze(1)
+        fused = tokens + ctrl_emb + exo_emb
+        attended, _ = self.attn(fused, fused, fused, key_padding_mask=mask < 0.5)
+        output = self.mlp(torch.cat([tokens, attended], dim=-1))
         return output * mask.unsqueeze(-1)
 
 
@@ -160,3 +267,7 @@ class EntityDecoder(nn.Module):
 
     def forward(self, factors: torch.Tensor) -> torch.Tensor:
         return self.mlp(factors)
+
+
+class StateDecoder(EntityDecoder):
+    pass

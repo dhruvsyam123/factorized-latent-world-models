@@ -13,7 +13,7 @@ from factor_latent_wm.utils.seeding import seed_everything
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Factorised latent-action world model")
+    parser = argparse.ArgumentParser(description="State-first factorised latent-action world model")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     write_config = subparsers.add_parser("write-config")
@@ -32,7 +32,7 @@ def _parse_args() -> argparse.Namespace:
     stage1.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     stage1.add_argument("--epochs", type=int, default=None)
     stage1.add_argument("--batch-size", type=int, default=None)
-    stage1.add_argument("--encoder-type", choices=["entity", "slot"], default=None)
+    stage1.add_argument("--encoder-type", choices=["state_factor", "pixel_slot", "entity", "slot"], default=None)
     stage1.add_argument("--entity-weight", type=float, default=None)
 
     stage2 = subparsers.add_parser("train-stage2")
